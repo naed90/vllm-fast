@@ -86,7 +86,7 @@ class Sampler(nn.Module):
             probs = _apply_top_p_top_k(probs, top_ps, top_ks)
 
         # Sample the next tokens.
-        return _sample(probs, logprobs, input_metadata)
+        return _sample2(probs, logprobs, input_metadata)
 
 
 def _prune_hidden_states(
@@ -412,6 +412,94 @@ def _sample(
             ]
             parent_seq_ids, next_token_ids = _sample_from_generation_tokens(
                 seq_ids, prob, logprob, seq_logprobs, sampling_params)
+
+            # Get top-k log probabilities for the next tokens.
+            next_logprobs: Dict[int, Dict[int, float]] = {}
+            for j, seq_id in enumerate(seq_ids):
+                next_logprobs[seq_id] = _get_topk_logprobs(
+                    logprob[j], sampling_params.logprobs)
+
+            # Build the output.
+            for seq_id, parent_seq_id, next_token_id in zip(
+                    seq_ids, parent_seq_ids, next_token_ids):
+                j = seq_ids.index(parent_seq_id)
+                output_logprobs = next_logprobs[parent_seq_id].copy()
+                output_logprobs[next_token_id] = logprob[j,
+                                                         next_token_id].item()
+                seq_outputs[seq_id] = SequenceOutputs(
+                    seq_id,
+                    parent_seq_id,
+                    next_token_id,
+                    output_logprobs,
+                )
+
+    return seq_outputs
+
+def _sample2(
+    probs: torch.Tensor,
+    logprobs: torch.Tensor,
+    input_metadata: InputMetadata,
+) -> Dict[int, SequenceOutputs]:
+    should_optimize = True
+
+    for i, seq_group in enumerate(input_metadata.seq_groups[input_metadata.num_prompts:]):
+        _, sampling_params = seq_group
+        if sampling_params.use_beam_search or sampling_params.temperature < _SAMPLING_EPS:
+            should_optimize = False
+            break
+
+    if should_optimize:
+        return _sample_optimized(probs, logprobs, input_metadata)
+    else:
+        return _sample(probs, logprobs, input_metadata)
+
+def _sample_optimized(
+    probs: torch.Tensor,
+    logprobs: torch.Tensor,
+    input_metadata: InputMetadata,
+) -> Dict[int, SequenceOutputs]:
+    seq_outputs: Dict[int, SequenceOutputs] = {}
+    
+    idx = 0
+    num_prompts = input_metadata.num_prompts
+
+    gen_probs = probs[num_prompts:]
+    gen_next_token_ids = torch.multinomial(gen_probs,
+                                        num_samples=1,
+                                        replacement=True).squeeze(dim=-1)
+
+    for i, seq_group in enumerate(input_metadata.seq_groups):
+        seq_ids, sampling_params = seq_group
+        if i < num_prompts:
+            # Generate the next tokens for a prompt input.
+            assert len(seq_ids) == sampling_params.best_of
+            prob = probs[idx]
+            logprob = logprobs[idx]
+            idx += 1
+
+            # Sample the next tokens.
+            next_token_ids = _sample_from_prompt(prob, sampling_params)
+            # Get top-k log probabilities for the next tokens.
+            next_logprobs = _get_topk_logprobs(logprob,
+                                               sampling_params.logprobs)
+
+            # Build the output.
+            for seq_id, next_token_id in zip(seq_ids, next_token_ids):
+                output_logprobs = next_logprobs.copy()
+                output_logprobs[next_token_id] = logprob[next_token_id].item()
+                seq_outputs[seq_id] = SequenceOutputs(seq_id, seq_id,
+                                                      next_token_id,
+                                                      output_logprobs)
+        else:
+            # Generate the next tokens for generation tokens.
+            prob = probs[idx:idx + len(seq_ids)]
+            logprob = logprobs[idx:idx + len(seq_ids)]
+
+            # Sample the next tokens.
+            next_token_ids = gen_next_token_ids[idx - num_prompts:idx + len(seq_ids) - num_prompts]
+            next_token_ids = next_token_ids.tolist()
+            parent_seq_ids = seq_ids
+            idx += len(seq_ids)
 
             # Get top-k log probabilities for the next tokens.
             next_logprobs: Dict[int, Dict[int, float]] = {}
