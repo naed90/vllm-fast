@@ -443,8 +443,8 @@ def _sample2(
     should_optimize = True
 
     for i, seq_group in enumerate(input_metadata.seq_groups[input_metadata.num_prompts:]):
-        _, sampling_params = seq_group
-        if sampling_params.use_beam_search or sampling_params.temperature < _SAMPLING_EPS:
+        seq_ids, sampling_params = seq_group
+        if sampling_params.use_beam_search or sampling_params.temperature < _SAMPLING_EPS or len(seq_ids) != 1:
             should_optimize = False
             break
 
@@ -460,22 +460,26 @@ def _sample_optimized(
 ) -> Dict[int, SequenceOutputs]:
     seq_outputs: Dict[int, SequenceOutputs] = {}
     
-    idx = 0
     num_prompts = input_metadata.num_prompts
 
     gen_probs = probs[num_prompts:]
     gen_next_token_ids = torch.multinomial(gen_probs,
                                         num_samples=1,
                                         replacement=True).squeeze(dim=-1)
+    chosen_logprobs = logprobs[num_prompts:][torch.arange(gen_next_token_ids.shape[0]), gen_next_token_ids]
+    chosen_logprobs = chosen_logprobs.squeeze(dim=-1)
+    if chosen_logprobs.dim() == 0:  # If it's a scalar (happens when `gen_next_token_ids.shape == torch.Size([1])`, due to torch indexing)
+        chosen_logprobs = chosen_logprobs.unsqueeze(0)  # Add a dimension back
+    chosen_logprobs = chosen_logprobs.tolist()
+    gen_next_token_ids = gen_next_token_ids.tolist()
 
     for i, seq_group in enumerate(input_metadata.seq_groups):
         seq_ids, sampling_params = seq_group
         if i < num_prompts:
             # Generate the next tokens for a prompt input.
             assert len(seq_ids) == sampling_params.best_of
-            prob = probs[idx]
-            logprob = logprobs[idx]
-            idx += 1
+            prob = probs[i]
+            logprob = logprobs[i]
 
             # Sample the next tokens.
             next_token_ids = _sample_from_prompt(prob, sampling_params)
@@ -492,33 +496,24 @@ def _sample_optimized(
                                                       output_logprobs)
         else:
             # Generate the next tokens for generation tokens.
-            prob = probs[idx:idx + len(seq_ids)]
-            logprob = logprobs[idx:idx + len(seq_ids)]
+            logprob = logprobs[i]
 
             # Sample the next tokens.
-            next_token_ids = gen_next_token_ids[idx - num_prompts:idx + len(seq_ids) - num_prompts]
-            next_token_ids = next_token_ids.tolist()
-            parent_seq_ids = seq_ids
-            idx += len(seq_ids)
+            next_token_id = gen_next_token_ids[i - num_prompts]
 
             # Get top-k log probabilities for the next tokens.
             next_logprobs: Dict[int, Dict[int, float]] = {}
-            for j, seq_id in enumerate(seq_ids):
-                next_logprobs[seq_id] = _get_topk_logprobs(
-                    logprob[j], sampling_params.logprobs)
+            seq_id = seq_ids[0]
+            next_logprobs[seq_id] = _get_topk_logprobs([logprob], sampling_params.logprobs)
 
             # Build the output.
-            for seq_id, parent_seq_id, next_token_id in zip(
-                    seq_ids, parent_seq_ids, next_token_ids):
-                j = seq_ids.index(parent_seq_id)
-                output_logprobs = next_logprobs[parent_seq_id].copy()
-                output_logprobs[next_token_id] = logprob[j,
-                                                         next_token_id].item()
-                seq_outputs[seq_id] = SequenceOutputs(
-                    seq_id,
-                    parent_seq_id,
-                    next_token_id,
-                    output_logprobs,
-                )
+            output_logprobs = next_logprobs[seq_id].copy()
+            output_logprobs[next_token_id] = chosen_logprobs[i - num_prompts]
+            seq_outputs[seq_id] = SequenceOutputs(
+                seq_id,
+                seq_id,
+                next_token_id,
+                output_logprobs,
+            )
 
     return seq_outputs
